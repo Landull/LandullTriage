@@ -50,7 +50,9 @@ def run_collection(config, case_dir=None):
         except Exception as e:  # one module failing never stops the rest
             res = {"error": f"{type(e).__name__}: {e}"}
             run.say(traceback.format_exc(limit=5), "error")
-            run.notes.setdefault(mid, []).append(f"Module error: {type(e).__name__}: {e}")
+            tb = traceback.extract_tb(e.__traceback__)
+            where = f" (at {os.path.basename(tb[-1].filename)}:{tb[-1].lineno} in {tb[-1].name})" if tb else ""
+            run.notes.setdefault(mid, []).append(f"Module error: {type(e).__name__}: {e}{where}")
             status = "failed"
         if run.stopped() and status == "ok":
             status = "partial"
@@ -147,8 +149,27 @@ def main(argv=None):
         cfg = {"case_id": a.case, "examiner": a.examiner, "notes": a.notes, "output_dir": a.out or os.getcwd(),
                "modules": mods, "log_days": a.log_days, "zip": a.zip, "echo": True}
     case_dir = run_collection(cfg, a.case_dir)
+    # end-of-run summary, so a scripted run shows what happened without opening the report
+    failed = False
+    try:
+        with open(os.path.join(case_dir, "case.json"), encoding="utf-8") as fh:
+            case = json.load(fh)
+        print("\nSummary:")
+        mods = sorted(case.get("modules", {}).items(), key=lambda kv: kv[1].get("status") != "ok")  # problems last
+        for mid, m in mods:
+            print(f"  {mid:<12} {m.get('status')}")
+            for n in (m.get("notes") or [])[:4]:
+                print(f"      - {str(n).splitlines()[0][:300]}")
+            failed = failed or m.get("status") == "failed"
+        print(f"  findings: {len(case.get('flags') or [])}")
+    except (OSError, ValueError):
+        pass
     print(case_dir)
-    return 0
+    if failed:
+        for mid, m in case.get("modules", {}).items():
+            if m.get("status") == "failed":
+                print(f"FAILED {mid}: " + " | ".join(str(n).splitlines()[0][:300] for n in m.get("notes") or []))
+    return 3 if failed else 0
 
 
 if __name__ == "__main__":
