@@ -1,0 +1,141 @@
+name: build
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          sed -i '' 's/^open -R.*//' "Build Mac App.command"
+          bash "Build Mac App.command" </dev/null
+          test -d dist/LandullTriage.app
+      - name: Smoke test + package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          APP="dist/LandullTriage.app/Contents/MacOS/LandullTriage"
+          "$APP" --version
+          "$APP" --vol -h > vol_help.txt 2>&1 || true
+          grep -q "mac.pslist" vol_help.txt && grep -q "windows.pslist" vol_help.txt
+          mkdir cases
+          "$APP" --collect --out cases --case CI --examiner ci --modules network,processes,system,users,persistence,browsers
+          C=$(ls -d cases/LandullTriage_*)
+          test -s "$C/report.html" && test -s "$C/manifest.sha256" && test -s "$C/processes/processes.csv"
+          (cd "$C" && shasum -a 256 -c manifest.sha256 --quiet)
+          python3 -c "import json,sys; c=json.load(open(sys.argv[1])); print({k:v['status'] for k,v in c['modules'].items()}); sys.exit(any(v['status']=='failed' for v in c['modules'].values()))" "$C/case.json"
+          mkdir -p shots
+          LANDULL_SCREENSHOT=shots/macos-collect.png "$APP"; LANDULL_SCREENSHOT=shots/macos-analyze.png LANDULL_SCREENSHOT_PAGE=analyze "$APP"
+          test -s shots/macos-collect.png && test -s shots/macos-analyze.png
+          cd dist && ditto -c -k --keepParent "LandullTriage.app" LandullTriage-macOS.zip
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: echo.| build_windows.bat
+      - name: Smoke test + package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = "dist\LandullTriage\LandullTriage.exe"
+          function Run($argList, $out) {
+            $p = Start-Process -FilePath $exe -ArgumentList $argList -RedirectStandardOutput $out -RedirectStandardError "$out.err" -NoNewWindow -Wait -PassThru
+            Get-Content $out -ErrorAction SilentlyContinue | Select-Object -Last 15; Get-Content "$out.err" -ErrorAction SilentlyContinue | Select-Object -Last 15
+            return $p.ExitCode
+          }
+          Run @("--version") "ver.txt"
+          if (-not (Test-Path "dist\LandullTriage\_internal\assets\bin\winpmem.exe")) { throw "WinPmem not bundled" }
+          # raw NTFS read of a locked registry hive, and a byte-for-byte check against a normal read
+          New-Item -ItemType Directory raw | Out-Null
+          Run @("--raw-copy", "C:\Windows\System32\config\SYSTEM", "raw\SYSTEM") "raw1.txt"
+          $hdr = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes("raw\SYSTEM")[0..3])
+          if ($hdr -ne "regf") { throw "raw copy of SYSTEM hive is not a registry file: $hdr" }
+          Run @("--raw-copy", "C:\Windows\System32\ntoskrnl.exe", "raw\ntoskrnl.exe") "raw2.txt"
+          if ((Get-FileHash raw\ntoskrnl.exe).Hash -ne (Get-FileHash C:\Windows\System32\ntoskrnl.exe).Hash) { throw "raw NTFS read differs from a normal read" }
+          Run @("--vol", "-h") "vol_help.txt"
+          if (-not (Select-String -Path vol_help.txt,vol_help.txt.err -Pattern "windows.pslist" -Quiet)) { throw "Volatility plugins not bundled" }
+          New-Item -ItemType Directory cases | Out-Null
+          Run @("--collect", "--out", "cases", "--case", "CI", "--examiner", "ci", "--modules", "network,processes,system,users,persistence,browsers,artifacts") "collect.txt"
+          $c = (Get-ChildItem cases -Directory | Select-Object -First 1).FullName
+          foreach ($f in "report.html","manifest.sha256","processes\processes.csv","persistence\autoruns.csv","artifacts\registry\system\SYSTEM") {
+            if (-not (Test-Path (Join-Path $c $f))) { throw "missing $f" }
+          }
+          $case = Get-Content (Join-Path $c "case.json") -Raw | ConvertFrom-Json
+          $case.modules.PSObject.Properties | ForEach-Object { "$($_.Name): $($_.Value.status)" }
+          if ($case.modules.PSObject.Properties | Where-Object { $_.Value.status -eq "failed" }) { throw "a module failed" }
+          New-Item -ItemType Directory shots | Out-Null
+          $env:LANDULL_SCREENSHOT = "$PWD\shots\windows-collect.png"; Start-Process -FilePath $exe -Wait
+          $env:LANDULL_SCREENSHOT = "$PWD\shots\windows-analyze.png"; $env:LANDULL_SCREENSHOT_PAGE = "analyze"; Start-Process -FilePath $exe -Wait
+          if (-not (Test-Path shots\windows-collect.png)) { throw "GUI did not start" }
+          Compress-Archive -Path dist\LandullTriage -DestinationPath dist\LandullTriage-Windows.zip
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y libegl1 libxkbcommon-x11-0 libxcb-cursor0
+          bash build_linux.sh
+      - name: Smoke test + package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          APP=dist/LandullTriage/LandullTriage
+          $APP --version
+          dist/LandullTriage/_internal/assets/bin/avml --help | head -3
+          $APP --vol -h > vol_help.txt 2>&1 || true
+          grep -q "linux.pslist" vol_help.txt
+          mkdir cases
+          sudo $APP --collect --out cases --case CI --examiner ci --modules network,processes,system,users,persistence,browsers
+          C=$(ls -d cases/LandullTriage_*)
+          test -s "$C/report.html" && test -s "$C/processes/processes.csv"
+          (cd "$C" && sudo sha256sum -c manifest.sha256 --quiet)
+          sudo python3 -c "import json,sys; c=json.load(open(sys.argv[1])); print({k:v['status'] for k,v in c['modules'].items()}); sys.exit(any(v['status']=='failed' for v in c['modules'].values()))" "$C/case.json"
+          mkdir -p shots
+          QT_QPA_PLATFORM=offscreen LANDULL_SCREENSHOT=shots/linux-collect.png $APP
+          QT_QPA_PLATFORM=offscreen LANDULL_SCREENSHOT=shots/linux-analyze.png LANDULL_SCREENSHOT_PAGE=analyze $APP
+          test -s shots/linux-collect.png
+          cd dist && tar czf LandullTriage-Linux.tar.gz LandullTriage
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots-${{ runner.os }}
+          path: shots/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LandullTriage-${{ runner.os }}
+          path: |
+            dist/LandullTriage-*.zip
+            dist/LandullTriage-*.tar.gz
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          body: |
+            Live-response evidence collection and memory analysis for Windows, macOS and Linux.
+
+            **Download:** Windows `LandullTriage-Windows.zip` · macOS (Apple Silicon) `LandullTriage-macOS.zip` · Linux `LandullTriage-Linux.tar.gz`
+
+            The app isn't code-signed, so your OS will warn the first time. See the README for the one-time "open anyway" step.

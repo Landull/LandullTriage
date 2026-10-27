@@ -1,0 +1,4 @@
+PySide6-Essentials>=6.6
+pyinstaller>=6.3
+volatility3>=2.26
+pefile>=2024.8.26
