@@ -195,6 +195,7 @@ class Run:
                                    "changed_or_created_utc", "method", "sha256"])
         self.notes = {}      # module id -> list of notes for the report
         self.flags = []      # findings worth a look: dicts with module, severity, what, detail
+        self._vss_failures = 0
         self.hash_cache = {} # abs path -> (size, mtime, sha256) so big files are hashed once
 
     # --- progress -------------------------------------------------------
@@ -258,18 +259,12 @@ class Run:
         t0 = utc_now()
         rc, so, se, err = None, "" if text else b"", "" if text else b"", ""
         try:
-            p = subprocess.run(cmd, capture_output=True, timeout=timeout, shell=shell, env=env,
-                               creationflags=no_window_flags(), input=input_data,
-                               stdin=None if input_data is not None else subprocess.DEVNULL)
-            rc = p.returncode
-            so, se = p.stdout, p.stderr
+            rc, so, se, err = _run_bounded(cmd, timeout, shell, env, input_data, self.stopped)
             if text:
                 so = _decode(so)
                 se = _decode(se)
         except FileNotFoundError:
             err = "program not found"
-        except subprocess.TimeoutExpired:
-            err = f"timed out after {timeout}s"
         except Exception as e:  # noqa
             err = f"{type(e).__name__}: {e}"
         t1 = utc_now()
@@ -378,10 +373,12 @@ class Run:
                 return True, "raw-ntfs"
         except Exception as e:
             self.say(f"  raw NTFS read failed for {src}: {e}", "warn")
-        if is_admin():
-            rc, _, _ = self.run(["esentutl.exe", "/y", src, "/vss", "/d", dest], timeout=600, quiet=True)
+        # shadow-copy fallback: each attempt creates a snapshot, so stop trying after it fails twice
+        if is_admin() and self._vss_failures < 2:
+            rc, _, _ = self.run(["esentutl.exe", "/y", src, "/vss", "/d", dest], timeout=300, quiet=True)
             if rc == 0 and os.path.exists(dest):
                 return True, "vss-esentutl"
+            self._vss_failures += 1
         return False, "failed"
 
     def copy_tree(self, root, dest_rel, patterns=None, max_files=5000, max_bytes=None):
@@ -419,6 +416,65 @@ class Run:
 
 
 # ------------------------------------------------------------------ internals
+def _kill_tree(p):
+    """Kill a process and everything it started (a hung grandchild must not outlive the timeout)."""
+    try:
+        if PLATFORM == "windows":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True, timeout=30,
+                           creationflags=no_window_flags())
+        else:
+            import signal
+            os.killpg(p.pid, signal.SIGKILL)
+    except Exception:
+        pass
+    try:
+        p.kill()
+    except Exception:
+        pass
+
+
+def _run_bounded(cmd, timeout, shell, env, input_data, stopped=None):
+    """
+    Run a command with output going to temporary files rather than pipes, so a grandchild that
+    inherits the handles can't keep us waiting, and kill the whole process tree on timeout or stop.
+    Returns (rc, stdout_bytes, stderr_bytes, error_text).
+    """
+    import tempfile
+    with tempfile.TemporaryFile() as fo, tempfile.TemporaryFile() as fe:
+        kw = {"creationflags": no_window_flags() | (0x00000200 if PLATFORM == "windows" else 0)}  # NEW_PROCESS_GROUP
+        if PLATFORM != "windows":
+            kw["start_new_session"] = True
+        stdin = subprocess.PIPE if input_data is not None else subprocess.DEVNULL
+        p = subprocess.Popen(cmd, stdout=fo, stderr=fe, stdin=stdin, shell=shell, env=env, **kw)
+        if input_data is not None:
+            try:
+                p.stdin.write(input_data if isinstance(input_data, bytes) else input_data.encode())
+                p.stdin.close()
+            except OSError:
+                pass
+        deadline = time.time() + timeout
+        err = ""
+        while p.poll() is None:
+            if time.time() > deadline:
+                _kill_tree(p)
+                err = f"timed out after {timeout}s"
+                break
+            if stopped and stopped():
+                _kill_tree(p)
+                err = "stopped by examiner"
+                break
+            time.sleep(0.1)
+        try:
+            rc = p.wait(15)
+        except subprocess.TimeoutExpired:
+            rc = None
+        if err:
+            rc = None
+        fo.seek(0)
+        fe.seek(0)
+        return rc, fo.read(), fe.read(), err
+
+
 def _decode(b):
     if b is None:
         return ""

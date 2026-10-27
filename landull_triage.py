@@ -1272,7 +1272,24 @@ def main():
     argv = sys.argv[1:]
     if argv and argv[0] in ("--collect", "--analyze", "--vol", "--raw-copy", "--version"):
         _fix_stdio()
-        mode, rest = argv[0], argv[1:]
+        # In a windowed (GUI) build an unhandled exception pops up a dialog and waits for a click,
+        # which would freeze a command-line or scripted run. Report it and exit instead.
+        try:
+            return _cli(argv[0], argv[1:])
+        except SystemExit:
+            raise
+        except KeyboardInterrupt:
+            return 130
+        except BaseException as e:  # noqa
+            msg = f"LandullTriage {argv[0]} failed: {type(e).__name__}: {e}"
+            print(msg, file=sys.stderr)
+            log(msg + "\n" + traceback.format_exc())
+            return 1
+    return gui_main()
+
+
+def _cli(mode, rest):
+    if True:
         if mode == "--version":
             from triage import VERSION
             print(f"LandullTriage {VERSION}")
@@ -1293,7 +1310,7 @@ def main():
             n = raw_copy(rest[0], rest[1])
             print(f"copied {n} bytes")
             return 0
-    return gui_main()
+    return 2
 
 
 def _restore_owner(args):
