@@ -65,8 +65,17 @@ jobs:
           Run @("--raw-copy", "C:\Windows\System32\config\SYSTEM", "raw\SYSTEM") "raw1.txt"
           $hdr = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes("raw\SYSTEM")[0..3])
           if ($hdr -ne "regf") { throw "raw copy of SYSTEM hive is not a registry file: $hdr" }
-          Run @("--raw-copy", "C:\Windows\System32\ntoskrnl.exe", "raw\ntoskrnl.exe") "raw2.txt"
-          if ((Get-FileHash raw\ntoskrnl.exe).Hash -ne (Get-FileHash C:\Windows\System32\ntoskrnl.exe).Hash) { throw "raw NTFS read differs from a normal read" }
+          # byte-for-byte check against a normal read, on a large file written in pieces (so it fragments)
+          $src = "C:\ltriage-rawtest.bin"; $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+          $fs = [System.IO.File]::Open($src, "Create"); $buf = New-Object byte[] (1MB)
+          for ($i = 0; $i -lt 64; $i++) { $rng.GetBytes($buf); $fs.Write($buf, 0, $buf.Length); $fs.Flush($true) }
+          $fs.SetLength(64MB + 12345); $fs.Close()
+          Run @("--raw-copy", $src, "raw\rawtest.bin") "raw2.txt"
+          if ((Get-FileHash raw\rawtest.bin).Hash -ne (Get-FileHash $src).Hash) { throw "raw NTFS read differs from a normal read" }
+          Remove-Item $src
+          # a WOF-compressed system file must be refused, never copied wrong
+          $wof = Run @("--raw-copy", "C:\Windows\System32\ntoskrnl.exe", "raw\ntoskrnl.exe") "raw3.txt"
+          if ((Test-Path raw\ntoskrnl.exe) -and ((Get-FileHash raw\ntoskrnl.exe).Hash -ne (Get-FileHash C:\Windows\System32\ntoskrnl.exe).Hash)) { throw "compressed file copied wrong instead of refused" }
           Run @("--vol", "-h") "vol_help.txt"
           if (-not (Select-String -Path vol_help.txt,vol_help.txt.err -Pattern "windows.pslist" -Quiet)) { throw "Volatility plugins not bundled" }
           New-Item -ItemType Directory cases | Out-Null
