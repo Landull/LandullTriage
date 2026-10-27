@@ -141,6 +141,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: out
+          pattern: LandullTriage-*
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
