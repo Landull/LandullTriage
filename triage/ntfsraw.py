@@ -17,7 +17,10 @@ Also usable against an image file: NTFSVolume(open("disk.raw", "rb"), offset=...
 import os
 import struct
 
-ATTR_LIST, FILE_NAME, DATA, INDEX_ROOT, INDEX_ALLOC, END = 0x20, 0x30, 0x80, 0x90, 0xA0, 0xFFFFFFFF
+ATTR_LIST, FILE_NAME, DATA, INDEX_ROOT, INDEX_ALLOC, REPARSE, END = 0x20, 0x30, 0x80, 0x90, 0xA0, 0xC0, 0xFFFFFFFF
+# reparse tags whose real file content is NOT in the unnamed $DATA stream
+REPARSE_NOT_IN_DATA = {0x80000017: "compressed by Windows (WOF/CompactOS)", 0x80000013: "deduplicated by Windows",
+                       0x8000001B: "an AppExecLink alias"}
 ROOT_RECORD = 5
 CHUNK = 4 * 1024 * 1024
 
@@ -304,7 +307,15 @@ class NTFSVolume:
     # ---------------------------------------------------------- file data
     def open_data(self, num):
         """(size, iterator factory) for the unnamed $DATA stream of a record."""
-        attrs = [a for a in self._all_attrs(num) if a.type == DATA and a.name == ""]
+        every = self._all_attrs(num)
+        rp = next((a for a in every if a.type == REPARSE), None)
+        if rp is not None:
+            raw = rp.value if rp.resident else self._read_runs(rp.runs, rp.real_size, rp.init_size)
+            tag = struct.unpack_from("<I", raw, 0)[0] if len(raw) >= 4 else 0
+            why = REPARSE_NOT_IN_DATA.get(tag) or ("a cloud placeholder (OneDrive etc.)" if tag & 0xFFFF0FFF == 0x9000001A else "")
+            if why:
+                raise NTFSError(f"file is {why}; its bytes aren't in the normal data stream (read it the normal way)")
+        attrs = [a for a in every if a.type == DATA and a.name == ""]
         if not attrs:
             raise NTFSError("file has no data stream")
         if any(a.flags & 0x0001 for a in attrs):
