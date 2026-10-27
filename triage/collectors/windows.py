@@ -88,15 +88,22 @@ def _signatures(run, paths):
     try:
         q = lst.replace("'", "''")
         data = _ps_json(run, f"Get-Content -LiteralPath '{q}' -Encoding UTF8 | Where-Object {{ $_ }} | ForEach-Object {{ "
-                             "$s = Get-AuthenticodeSignature -LiteralPath $_ -ErrorAction SilentlyContinue; "
-                             "[pscustomobject]@{Path=$_; Status=[string]$s.Status; Signer=$(if ($s.SignerCertificate) "
+                             "$s = Get-AuthenticodeSignature -LiteralPath ([string]$_) -ErrorAction SilentlyContinue; "
+                             "[pscustomobject]@{Path=[string]$_; Status=[string]$s.Status; Signer=$(if ($s.SignerCertificate) "
                              "{$s.SignerCertificate.Subject} else {''})} }", timeout=600)
     finally:
         try:
             os.remove(lst)
         except OSError:
             pass
-    return {d.get("Path", "").lower(): (d.get("Status", ""), d.get("Signer", "")) for d in data}
+    return {_text(d.get("Path")).lower(): (_text(d.get("Status")), _text(d.get("Signer"))) for d in data}
+
+
+def _text(v):
+    """PowerShell 5.1 sometimes serializes a string with its extra note properties as {"value": ...}."""
+    if isinstance(v, dict):
+        v = v.get("value", v.get("Value", ""))
+    return "" if v is None else str(v)
 
 
 def collect_processes(run):
@@ -112,8 +119,8 @@ def collect_processes(run):
     by_pid = {p.get("ProcessId"): p for p in procs}
     rows = []
     for p in procs:
-        exe = p.get("ExecutablePath") or ""
-        name = (p.get("Name") or "").lower()
+        exe = _text(p.get("ExecutablePath"))
+        name = _text(p.get("Name")).lower()
         parent = by_pid.get(p.get("ParentProcessId"))
         pname = (parent.get("Name") or "").lower() if parent else ""
         st, signer = sigs.get(exe.lower(), ("", ""))
